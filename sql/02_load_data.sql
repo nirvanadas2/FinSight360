@@ -1,0 +1,2 @@
+-- 02_load_data.sql
+-- Loads cleaned CSV/parquet output from src/data_cleaning.py into finsight.* tables.
