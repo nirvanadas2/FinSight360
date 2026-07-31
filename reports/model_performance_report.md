@@ -171,3 +171,96 @@ attention, exactly the leakage pattern the exclusion was meant to avoid.
 
 XGBoost is the selected model. Rather than deploying a single "optimal" threshold, Section 5's tradeoff
 table is the deliverable: pick the row that matches actual review-queue capacity.
+
+---
+
+# Model Performance Report — Fraud Detection (Rule Engine vs Isolation Forest)
+
+**Notebook:** `notebooks/05_fraud_anomaly_detection.ipynb` | **Module:** `src/fraud_detection.py`
+**Data source:** PostgreSQL `finsight.transactions` (via `src/db_connect.py`), 6,362,620 transactions, 8,213
+fraudulent (0.1291%)
+
+## 1. Rule Engine (Section 4 Q5)
+
+`fraud_detection.write_rule_flags()` runs the Q5 balance-drain signature as a single `UPDATE` against
+every row of `finsight.transactions`, writing 1/0 into `is_flagged_rule`: sender account fully emptied
+(`sender_bal_before > 0`, `sender_bal_after = 0`, `amount = sender_bal_before`) on a TRANSFER or CASH_OUT
+— the two transaction types fraud is confined to (`notebooks/02_eda_fraud.ipynb`).
+
+| Metric | Value |
+|---|---|
+| Transactions flagged by rule | 8,008 (0.1259% of all transactions) |
+| True positives | 8,008 |
+| False positives | 0 |
+| False negatives (fraud missed) | 205 |
+| **Precision** (Q6) | **100.00%** |
+| **Recall** | **97.50%** |
+| F1 | 0.9874 |
+
+Confirms the EDA finding: the balance-drain rule is essentially perfect precision, and catches all but 205
+of the 8,213 fraudulent transactions — 164 TRANSFER (avg. amount ₹9.17M) and 41 CASH_OUT (avg. amount
+₹134K) that don't match the exact drain signature.
+
+## 2. Isolation Forest
+
+**Features** (`fraud_detection.engineer_anomaly_features`): `amount`, raw sender/receiver balances,
+engineered balance-delta and balance-error terms (e.g. `sender_balance_error = sender_bal_after -
+(sender_bal_before - amount)`, which is ~0 for a consistent ledger entry and large otherwise), and
+one-hot `txn_type` — 14 features total. Unsupervised: `is_fraud` is never used during training, only for
+evaluation afterward.
+
+**Training**: `sklearn.ensemble.IsolationForest`, `n_estimators=200`, `random_state=42`
+(`fraud_detection.RANDOM_STATE`, applied everywhere sampling is involved per the Part 5 reproducibility
+fix). `contamination` set to 0.001259 — the rule engine's own flagged rate — so both detectors are
+compared at matched review-queue volume (8,008 transactions each) rather than one flagging a much larger
+or smaller set.
+
+### Full-population comparison
+
+| Detector | Precision | Recall | F1 | TP | FP | FN | TN |
+|---|---|---|---|---|---|---|---|
+| Rule engine (Q5) | 1.0000 | 0.9750 | 0.9874 | 8,008 | 0 | 205 | 6,354,407 |
+| Isolation Forest | 0.0136 | 0.0133 | 0.0134 | 109 | 7,899 | 8,104 | 6,346,508 |
+
+At matched flagged volume, Isolation Forest is dramatically worse than the rule on the full population —
+expected, since ~97.5% of fraud already matches an exact, low-noise numerical signature the rule expresses
+directly, while an unsupervised model has no way to know that signature is the one that matters among all
+the ways a transaction can look "anomalous."
+
+### The real test: the 205-transaction residual the rule misses
+
+The full-population numbers above are the wrong comparison to draw a conclusion from — they're dominated
+by fraud the rule already wins on by construction. The question worth asking is narrower: **of the 205
+fraud transactions that don't match the rule's exact signature, does an anomaly model catch any of them
+independently?**
+
+| Detector | Residual fraud caught | Residual recall | Precision on rule's blind spot |
+|---|---|---|---|
+| Rule engine | 0 / 205 | 0.00% | — |
+| Isolation Forest | 91 / 205 | **44.39%** | 1.14% |
+
+Isolation Forest catches **91 of the 205** fraud transactions the rule's exact signature misses — a real,
+independent signal (median anomaly score for residual fraud is -0.0063 vs. -0.3311 for an equal-sized
+random legitimate sample, confirming genuine separation, not noise). But the cost is steep: of the 7,990
+transactions it flags beyond what the rule already flags, only 1.14% (91) are actually fraud — a ~99%
+false-positive rate on those incremental flags. Whether that trade is worth it is a review-queue capacity
+question, the same framing as Section 5 of the credit risk report above: a 44% lift in catching the rule's
+blind spot, paid for with ~7,900 additional low-precision alerts per 6.36M transactions scored.
+
+## Summary
+
+| Detector | Scope | Precision | Recall |
+|---|---|---|---|
+| Rule engine (Q5 balance-drain) | Full population | 100.00% | 97.50% |
+| Isolation Forest (matched volume) | Full population | 1.36% | 1.33% |
+| Isolation Forest | Residual (205 fraud the rule misses) | 1.14%* | 44.39% |
+
+\* Precision computed over Isolation Forest's incremental flags within the rule's blind spot (transactions
+the rule did not already flag), not the residual fraud count itself.
+
+**Conclusion**: the rule engine should stay as the primary detector — it is materially better everywhere
+that matters, including on the volume-matched full-population comparison. Isolation Forest is not a
+credible standalone replacement given its full-population precision (1.36%) is two orders of magnitude
+below the rule's. Its one genuine value-add is narrow: as a secondary, lower-priority review signal
+targeted specifically at transactions the rule engine did *not* flag, where it recovers 44% of otherwise-missed
+fraud, at a cost of a low-single-digit-percent precision on that add-on queue.
