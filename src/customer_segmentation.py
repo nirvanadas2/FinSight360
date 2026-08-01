@@ -185,3 +185,36 @@ def write_customers(engine, df: pd.DataFrame) -> int:
     with engine.begin() as conn:
         conn.execute(text("TRUNCATE TABLE finsight.customers"))
     return bulk_load(engine, df, "finsight.customers", CUSTOMER_SCHEMA_COLUMNS)
+
+
+# risk_score (0-100, higher = more disengagement risk): a percentile-rank blend of the same
+# three RFM fields already persisted on finsight.customers, run as a single SQL UPDATE rather
+# than round-tripping 6.35M rows through pandas. Weighted 50% Recency / 25% Frequency / 25%
+# Monetary - Frequency gets a reduced weight deliberately, because 99.85% of customers sit at
+# Frequency=1 (see notebooks/06_customer_segmentation_rfm.ipynb Section 2), so it barely
+# differentiates anyone; this is a lighter-weight, dashboard-facing heuristic derived from the
+# already-computed RFM fields, not a re-run of the K-Means model or a validated churn score -
+# treat it as a rough ranking signal, not a calibrated probability.
+RISK_SCORE_SQL = """
+    UPDATE finsight.customers c
+    SET risk_score = sub.risk_score
+    FROM (
+        SELECT customer_id,
+               ROUND((100 * (
+                   0.50 * PERCENT_RANK() OVER (ORDER BY last_txn_date DESC)
+                   + 0.25 * PERCENT_RANK() OVER (ORDER BY total_txn_count DESC)
+                   + 0.25 * PERCENT_RANK() OVER (ORDER BY total_txn_value DESC)
+               ))::numeric, 2) AS risk_score
+        FROM finsight.customers
+    ) AS sub
+    WHERE c.customer_id = sub.customer_id;
+"""
+
+
+def write_risk_scores(engine) -> int:
+    """Backfills finsight.customers.risk_score for every row via RISK_SCORE_SQL.
+    Requires segment/RFM fields to already be populated (i.e. run after write_customers()).
+    """
+    with engine.begin() as conn:
+        result = conn.execute(text(RISK_SCORE_SQL))
+        return result.rowcount

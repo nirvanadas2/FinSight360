@@ -4,7 +4,11 @@ Rule engine: Section 4 Q5's balance-drain signature (sender account emptied in
 a single TRANSFER/CASH_OUT), written back to finsight.transactions.is_flagged_rule.
 Isolation Forest: unsupervised anomaly scoring over every transaction, evaluated
 against the same is_fraud ground truth to see what it catches beyond the rule.
+Both, plus anomaly_score/is_flagged_iforest, are written back to finsight.transactions
+so a BI tool can query them directly instead of only reading them from the notebook.
 """
+
+import io
 
 import pandas as pd
 from sklearn.ensemble import IsolationForest
@@ -78,6 +82,19 @@ def engineer_anomaly_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def train_isolation_forest(X: pd.DataFrame, contamination: float) -> IsolationForest:
+    """Fit IsolationForest with a fixed random_state.
+
+    Reproducibility warning: IsolationForest bootstraps each tree by X's *positional*
+    row index (0..n-1), not by any ID column - a fixed random_state only reproduces the
+    same result if the caller's row order is also fixed. Postgres does not guarantee row
+    order for an unordered SELECT, and it silently changed here once (between two runs of
+    notebooks/05_fraud_anomaly_detection.ipynb) after write_iforest_scores()'s own bulk
+    UPDATE rewrote finsight.transactions' physical row layout - producing a materially
+    different model from the same seed and the same underlying data. Always pull X's
+    source rows with an explicit ORDER BY (e.g. `ORDER BY txn_id`) before calling this;
+    verified deterministic (bit-identical anomaly scores across two fits) once row order
+    is fixed - see reports/model_performance_report.md Section 2 for the full incident.
+    """
     model = IsolationForest(
         n_estimators=200, contamination=contamination,
         random_state=RANDOM_STATE, n_jobs=-1,
@@ -104,3 +121,45 @@ def precision_recall(y_true, y_pred) -> dict:
         "recall": recall_score(y_true, y_pred, zero_division=0),
         "tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn),
     }
+
+
+def write_iforest_scores(engine, scored: pd.DataFrame) -> int:
+    """Bulk-writes anomaly_score/is_flagged_iforest back to finsight.transactions.
+
+    `scored` must have txn_id, anomaly_score, is_flagged_iforest columns - i.e. the
+    txn_df produced by notebooks/05_fraud_anomaly_detection.ipynb Section 4
+    (score_transactions() output joined back onto the txn_id it was scored from).
+
+    Loads into a TEMP TABLE via COPY, then a single UPDATE...FROM join - the same
+    fast-path reasoning as db_connect.bulk_load: a per-row UPDATE over 6.36M
+    transactions would be far too slow, and TEMP TABLE + COPY + join is the
+    standard way to bulk-update (rather than bulk-insert) at this scale.
+    """
+    buf = io.StringIO()
+    scored[["txn_id", "anomaly_score", "is_flagged_iforest"]].to_csv(buf, index=False, header=False)
+    buf.seek(0)
+    raw_conn = engine.raw_connection()
+    try:
+        with raw_conn.cursor() as cur:
+            cur.execute("""
+                CREATE TEMP TABLE _iforest_scores (
+                    txn_id BIGINT, anomaly_score NUMERIC, is_flagged_iforest SMALLINT
+                ) ON COMMIT DROP
+            """)
+            cur.copy_expert(
+                "COPY _iforest_scores (txn_id, anomaly_score, is_flagged_iforest) "
+                "FROM STDIN WITH (FORMAT csv)",
+                buf,
+            )
+            cur.execute("""
+                UPDATE finsight.transactions t
+                SET anomaly_score = s.anomaly_score,
+                    is_flagged_iforest = s.is_flagged_iforest
+                FROM _iforest_scores s
+                WHERE t.txn_id = s.txn_id
+            """)
+            updated = cur.rowcount
+        raw_conn.commit()
+    finally:
+        raw_conn.close()
+    return updated

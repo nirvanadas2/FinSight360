@@ -43,7 +43,9 @@ CREATE TABLE finsight.transactions (
     receiver_bal_before NUMERIC(14,2),
     receiver_bal_after  NUMERIC(14,2),
     is_fraud          SMALLINT,          -- ground truth label (from PaySim)
-    is_flagged_rule   SMALLINT           -- flagged by business rule engine
+    is_flagged_rule   SMALLINT,          -- flagged by business rule engine
+    anomaly_score     NUMERIC(10,6),     -- Isolation Forest decision_function, higher = more anomalous
+    is_flagged_iforest SMALLINT          -- Isolation Forest flag, contamination matched to is_flagged_rule's rate
 );
 
 -- ===== MARKET DATA MODULE =====

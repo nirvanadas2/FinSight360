@@ -215,12 +215,24 @@ fix). `contamination` set to 0.001259 — the rule engine's own flagged rate —
 compared at matched review-queue volume (8,008 transactions each) rather than one flagging a much larger
 or smaller set.
 
+**Reproducibility note**: an earlier version of this report cited different numbers here (109 TP / 91
+residual caught). Root cause: `IsolationForest` bootstraps each tree by *positional* row index, not by
+`txn_id`, so a fixed `random_state` alone doesn't guarantee reproducibility unless the input row order is
+also fixed. The notebook's pull query originally had no `ORDER BY`, and once `anomaly_score`/
+`is_flagged_iforest` were written back to `finsight.transactions` (an `UPDATE` that rewrites every row's
+physical position on disk), the unordered `SELECT` silently started returning a different row order than
+it had the first time — changing the model's tree-level bootstrap samples despite the unchanged seed and
+unchanged underlying data. Fixed by adding `ORDER BY txn_id` to the pull query
+(`notebooks/05_fraud_anomaly_detection.ipynb` Section 4) and verified deterministic: two independent fits
+on the now-fixed row order produced bit-identical `anomaly_score` values and an identical flagged set. The
+numbers below are from that stable, reproducible run.
+
 ### Full-population comparison
 
 | Detector | Precision | Recall | F1 | TP | FP | FN | TN |
 |---|---|---|---|---|---|---|---|
 | Rule engine (Q5) | 1.0000 | 0.9750 | 0.9874 | 8,008 | 0 | 205 | 6,354,407 |
-| Isolation Forest | 0.0136 | 0.0133 | 0.0134 | 109 | 7,899 | 8,104 | 6,346,508 |
+| Isolation Forest | 0.0061 | 0.0060 | 0.0060 | 49 | 7,959 | 8,164 | 6,346,448 |
 
 At matched flagged volume, Isolation Forest is dramatically worse than the rule on the full population —
 expected, since ~97.5% of fraud already matches an exact, low-noise numerical signature the rule expresses
@@ -237,30 +249,32 @@ independently?**
 | Detector | Residual fraud caught | Residual recall | Precision on rule's blind spot |
 |---|---|---|---|
 | Rule engine | 0 / 205 | 0.00% | — |
-| Isolation Forest | 91 / 205 | **44.39%** | 1.14% |
+| Isolation Forest | 38 / 205 | **18.54%** | 0.475% |
 
-Isolation Forest catches **91 of the 205** fraud transactions the rule's exact signature misses — a real,
-independent signal (median anomaly score for residual fraud is -0.0063 vs. -0.3311 for an equal-sized
-random legitimate sample, confirming genuine separation, not noise). But the cost is steep: of the 7,990
-transactions it flags beyond what the rule already flags, only 1.14% (91) are actually fraud — a ~99%
-false-positive rate on those incremental flags. Whether that trade is worth it is a review-queue capacity
-question, the same framing as Section 5 of the credit risk report above: a 44% lift in catching the rule's
-blind spot, paid for with ~7,900 additional low-precision alerts per 6.36M transactions scored.
+Isolation Forest catches **38 of the 205** fraud transactions the rule's exact signature misses — a real,
+independent signal (median anomaly score for residual fraud is -0.0202 vs. -0.3312 for an equal-sized
+random legitimate sample, confirming genuine separation, not noise, even though the effect is weaker than
+the earlier miscalculated run suggested). But the cost is steep: of the 7,997 transactions it flags beyond
+what the rule already flags, only 0.475% (38) are actually fraud — a ~99.5% false-positive rate on those
+incremental flags. Whether that trade is worth it is a review-queue capacity question, the same framing as
+Section 5 of the credit risk report above: an 18.5% lift in catching the rule's blind spot, paid for with
+~8,000 additional low-precision alerts per 6.36M transactions scored.
 
 ## Summary
 
 | Detector | Scope | Precision | Recall |
 |---|---|---|---|
 | Rule engine (Q5 balance-drain) | Full population | 100.00% | 97.50% |
-| Isolation Forest (matched volume) | Full population | 1.36% | 1.33% |
-| Isolation Forest | Residual (205 fraud the rule misses) | 1.14%* | 44.39% |
+| Isolation Forest (matched volume) | Full population | 0.61% | 0.60% |
+| Isolation Forest | Residual (205 fraud the rule misses) | 0.475%* | 18.54% |
 
 \* Precision computed over Isolation Forest's incremental flags within the rule's blind spot (transactions
 the rule did not already flag), not the residual fraud count itself.
 
 **Conclusion**: the rule engine should stay as the primary detector — it is materially better everywhere
 that matters, including on the volume-matched full-population comparison. Isolation Forest is not a
-credible standalone replacement given its full-population precision (1.36%) is two orders of magnitude
-below the rule's. Its one genuine value-add is narrow: as a secondary, lower-priority review signal
-targeted specifically at transactions the rule engine did *not* flag, where it recovers 44% of otherwise-missed
-fraud, at a cost of a low-single-digit-percent precision on that add-on queue.
+credible standalone replacement given its full-population precision (0.61%) is two orders of magnitude
+below the rule's. Its one genuine value-add is narrow and modest: as a secondary, lower-priority review
+signal targeted specifically at transactions the rule engine did *not* flag, where it recovers under a
+fifth of otherwise-missed fraud, at a cost of a sub-1%-precision add-on queue — a real but limited signal,
+not the "40%+ lift" this report previously (incorrectly) claimed before the reproducibility fix above.
