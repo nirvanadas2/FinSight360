@@ -16,3 +16,4 @@ tabulate
 python-dotenv
 jupyter
 ipykernel
+pytest
